@@ -1,0 +1,90 @@
+---
+title: "Thinking through a power analysis for a case series method for deaths and high heat days"
+author: "Brooke Anderson"
+date: "September 2, 2015"
+output: html_document
+---
+
+```{r, message = FALSE}
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+```
+
+## Simple example
+
+First, I'll need to decide how rare the event is. Let's say that only 2% of days are "high heat days". Now I'll take a warm season of data and randomly put in high heat days on 5% of those days:
+
+```{r}
+sim_data <- data.frame(date = seq(from = as.Date("2000-01-01"),
+                to = as.Date("2009-12-31"), by = 1)) %>%
+        filter(months(date) %in% c("May", "June", "July",
+                                  "August", "September"))
+table(months(sim_data$date))
+```
+
+```{r}
+heat_days <- sample(sim_data$date, round(nrow(sim_data) * 0.02))
+sim_data <- mutate(sim_data, 
+                   heat_day = date %in% heat_days,
+                   year = format(date, "%Y"),
+                   day_of_year = yday(date))
+head(sim_data, 20)
+```
+
+The following plot shows the days that were randomly selected as heat days:
+
+```{r}
+ggplot(sim_data, aes(x = day_of_year, y = heat_day)) + 
+        geom_point() + 
+        facet_grid(year ~ . )
+```
+
+The next thing I'll need to decide are: 
+
+1. What is the baseline rate of the outcome (e.g., cardiovascular death)
+2. What is the effect size of a heat day (i.e., the relative incidence for heat days versus other days)
+
+I'll check out what I can see if I set the baseline rate of the outcome to be 50 per day and the relative incidence for a heat day to be 1.50 (i.e., a 50% increase):
+
+```{r}
+baseline_rate <- 50
+RI <- 1.50
+```
+
+Now I'll simulate the numbers of outcomes on each day. I'm assuming a Poisson distribution for the number of deaths:
+
+```{r}
+sim_data$outcome <- NA
+risk_numbers <- table(sim_data$heat_day)
+sim_data$outcome[sim_data$heat_day == FALSE] <- rpois(
+                                                risk_numbers["FALSE"],
+                                                       baseline_rate)
+sim_data$outcome[sim_data$heat_day == TRUE] <- rpois(
+                                                risk_numbers["TRUE"],
+                                                baseline_rate * RI)
+```
+
+```{r}
+ggplot(sim_data, aes(x = day_of_year, y = outcome, color = heat_day)) +
+        geom_point() + 
+        facet_grid(year ~ .)
+```
+
+You can see from this that, with a relative incidence of 1.50 and all the other assumptions, you can clearly pick out an increase in incidence during risk days just by eye-balling the figure.
+
+Now, I can run a GLM on this to see if I identify the effect:
+
+```{r}
+mod_1 <- glm(outcome ~ heat_day, data = sim_data, 
+             family = poisson(link = "log"))
+summary(mod_1)$coef
+exp(summary(mod_1)$coef[2, 1])
+exp(confint(mod_1)[2, ]) 
+```
+
+This has generated a point estimate almost identical to the RI used in the model, and the confidence interval is surrounding the specified RI. The p-value for the heat days coefficient is `r summary(mod_1)$coef[2, 4]`, well below 0.05.
+
+## Simple function to estimate power
+
+Next, I'll take these ideas and put them into a simple function that takes in inputs of number of study days, percent of days in the high risk category, assumed effect size for being in a risk period (relative incidence), and the baseline rate of the outcome. The function will do a similar calculation to what I just did, and then will result in a yes / no answer of whether, for a single simulation, it found that the p-value of the effect size was smaller than 0.05. I can then run this function in `replicate()` to simulate many times and come up with the proportion of the time that the null hypothesis failed to be rejected at a true effect size of that specified by the RI value.

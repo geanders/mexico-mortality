@@ -1,0 +1,534 @@
+---
+title: "Example of a case series method for deaths and high heat days"
+author: "Brooke Anderson"
+date: "September 2, 2015"
+output: html_document
+---
+
+## Set-up
+
+Required libraries:
+
+```{r, message = FALSE}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(gnm)
+library(tsModel)
+library(survival)
+```
+
+## Exploring the data
+
+First, I read in the `heat_deaths` data, which I generated from the original `deaths` data using the R script `clean_heat_deaths.R`. I'll limit this data just to date, maximum daily temperature, and number of heat deaths.
+
+```{r}
+heat_deaths <- read.csv("heat_deaths.csv") %>%
+        dplyr::select(day, temp_max, heat_deaths) %>%
+        mutate(day = as.Date(as.character(day)))
+head(heat_deaths)
+```
+
+Over the year, there were `r sum(heat_deaths$heat_deaths)` deaths coded X30 for "Exposure to excessive natural heat":
+
+```{r}
+sum(heat_deaths$heat_deaths)
+```
+
+Here is the distribution of the maximum temperatures:
+
+```{r, fig.width = 5, fig.height = 2.75}
+ggplot(heat_deaths, aes(x = temp_max)) + 
+        geom_histogram(binwidth = 0.5, fill = "black",
+                       colour = "white") + 
+        xlab("Maximum daily temperature (C)") + 
+        ylab("Number of days") + 
+        theme_bw() + 
+        ggtitle("Distribution of max temperature")
+```
+
+A few notes: 
+
+- It looks like there are some very cold days, but not much evidence of unusual heat (as in, a few days much hotter than all other days). In fact, it almost looks like the weather data might be censored above 30C. There's a chance this might be partially related to fact that a lot of July data is missing (see next graph), but it also seems a bit odd...
+- It's fairly rare for a day to have a maximum temperature above 28C. In fact, there are only `r sum(heat_deaths$temp_max >= 28, na.rm = TRUE)` days with temperatures 27C or higher.
+
+Here is a graph showing dates of missing data for temperature:
+
+```{r, fig.width = 6, fig.height = 2.75}
+ggplot(heat_deaths, aes(x = day, y = is.na(temp_max))) + 
+        geom_point(size = 1) + 
+        theme_bw() + 
+        xlab("Date") + ylab("Is max temp missing?") + 
+        ggtitle("Missing max temp data")
+```
+
+## Risk period
+
+For this example, I'll consider a day with maximum temperature 28C or higher a "heat day". I'll consider that this exposure creates an immediate (i.e., lag 0) risk, so the risk periods are the heat days:
+
+```{r}
+heat_deaths <- mutate(heat_deaths, 
+                      heat_day = temp_max >= 28)
+summary(heat_deaths$heat_day)
+```
+
+From this, you can see that `r sum(heat_deaths$heat_day, na.rm = TRUE)` days are risk periods, `r sum(!heat_deaths$heat_day, na.rm = TRUE)` days are not risk periods, and `r sum(is.na(heat_deaths$heat_day))` days we can't identify as risk periods or not, because the maximum temperature data is missing those days.
+
+```{r, warning = FALSE, fig.width = 6, fig.height = 2.75}
+ggplot(heat_deaths, aes(day, heat_day)) + 
+        geom_point() + 
+        theme_bw() + 
+        xlab("Date") + ylab("Is a heat day?") + 
+        ggtitle("Risk periods")
+```
+
+Interestingly, all of the risk periods for heat are in the late spring. If you plot out the maximum temperatures by date, you can see that this is consistent with temperature patterns (I've added a reference line at 28C and colored points by category as a risk period): 
+
+```{r, warning = FALSE, fig.width = 6, fig.height = 2.75}
+ggplot(heat_deaths, aes(day, temp_max, colour = heat_day)) + 
+        geom_point() + 
+        theme_bw() + 
+        xlab("Date") + ylab("Maximum temperature") + 
+        ggtitle("Max temp by date") + 
+        geom_hline(yintercept = 28, alpha = 0.3, color = "red")
+```
+
+## Outcomes
+
+In terms of the outcome (heat deaths), here is a plot of heat deaths by date (I've colored by whether we're missing maximum temperature data for that day):
+
+```{r, fig.width = 6, fig.height = 2.75}
+ggplot(heat_deaths, aes(day, heat_deaths, color = is.na(heat_day))) + 
+        geom_point() + 
+        theme_bw() + 
+        xlab("Date") + ylab("# of heat deaths") + 
+        ggtitle("Heat deaths by date")
+```
+
+Heat deaths occurred through out the spring (even late winter in a few cases) and into the summer and early fall. The only days with multiple heat deaths were in the months `r paste(unique(format(heat_deaths$day[heat_deaths$heat_deaths > 1], "%B")), collapse = " and ")`:
+
+```{r}
+subset(heat_deaths, heat_deaths > 1)
+```
+
+## Self-controlled case series
+
+Next, I'll take out the missing days and then create a summary table:
+
+```{r}
+heat_tab <- filter(heat_deaths, !is.na(temp_max)) %>%
+        group_by(heat_day) %>%
+        summarise(days = n(), events = sum(heat_deaths))
+heat_tab
+```
+
+Based on Whitaker et al.'s 2006 *Statistics in Medicine* article, I'll fit this using a Poisson GLM:
+
+```{r}
+mod_1 <- glm(events ~ heat_day,
+           offset = log(days),
+           data = heat_tab,
+           family = poisson(link = "log"))
+summary(mod_1)
+```
+
+I can calculate the relative incidence by exponentiating the coefficient estimate for the `heat_day` variable:
+
+```{r}
+heat_coef <- summary(mod_1)$coef["heat_dayTRUE", 1:2]
+heat_coef
+
+conf_int <- heat_coef[1] + c(-1, 1) * 1.96 * heat_coef[2]
+conf_int
+
+relative_incidence <- paste0(round(exp(heat_coef[1]), 1), " (",
+                             round(exp(conf_int[1]), 1), ", ", 
+                             round(exp(conf_int[2]), 1), ")")
+relative_incidence
+```
+
+Therefore, we expect heat deaths to be about `r round(exp(heat_coef[1]))` times more common during risk periods from heat (as I've defined heat risk periods here) compared to outside of risk periods.
+
+I think that we should get the same estimate if we apply the model to the uncollapsed data. In this case, it wouldn't be necessary to include an offset for the number of days, since there is a separate observation for each day.
+
+```{r}
+mod_2 <- glm(heat_deaths ~ heat_day,
+           data = heat_deaths,
+           family = poisson(link = "log"))
+summary(mod_2)
+
+heat_coef <- summary(mod_2)$coef["heat_dayTRUE", 1:2]
+heat_coef
+
+conf_int <- heat_coef[1] + c(-1, 1) * 1.96 * heat_coef[2]
+conf_int
+
+relative_incidence <- paste0(round(exp(heat_coef[1]), 1), " (",
+                             round(exp(conf_int[1]), 1), ", ", 
+                             round(exp(conf_int[2]), 1), ")")
+relative_incidence
+```
+
+This does result in exactly the same effect estimate. 
+
+## Adding in strata
+
+Next, I'll check out the relationship between heat risk days and cardiorespiratory deaths, using a stratification variable for month and day of week. 
+
+First, I'll load the cardiorespiratory death data:
+
+```{r}
+cardioresp_deaths <- read.csv("cardioresp_deaths.csv") %>%
+        dplyr::select(day, temp_max, cvd_deaths, resp_deaths) %>%
+        mutate(day = as.Date(as.character(day)))
+head(cardioresp_deaths)
+```
+
+Here are plots for patterns by date in the counts of these two causes of death:
+
+```{r, fig.width = 6, fig.height = 4}
+to_plot <- gather(cardioresp_deaths, cause, deaths, -day, -temp_max)
+to_plot$cause <- sub("_deaths", "", to_plot$cause)
+head(to_plot)
+
+ggplot(to_plot, aes(x = day, y = deaths)) + 
+        geom_line() + 
+        facet_grid(cause ~ .) + 
+        ggtitle("Death counts by date, 2008")
+```
+
+Based on this, there aren't any days with no deaths for either of the two causes. Also, cardiovascular counts are consistently higher than respiratory counts.
+
+I'll limit the data we look at to March to September. Based on the earlier temperature plot, it seems that these dates would cover the "warm-season" for this location. Also, it looks like there might be some data quality issues in December, particularly at the very end of the month, so reducing to the warm season will eliminate this data. 
+
+```{r}
+cardioresp_deaths <- filter(cardioresp_deaths,
+                            months(day) %in% c("March", "April",
+                                               "May", "June",
+                                               "July", "August",
+                                               "September"))
+range(cardioresp_deaths$day)
+```
+
+The baseline counts of deaths for both of these causes vary seasonally and by day of the week. 
+
+```{r, fig.width = 6, fig.height = 4}
+to_plot <- gather(cardioresp_deaths, cause, deaths, -day, -temp_max)
+to_plot$cause <- sub("_deaths", "", to_plot$cause)
+to_plot <- mutate(to_plot,
+                  weekday = factor(weekdays(day),
+                                   levels = c("Sunday", "Monday", 
+                                              "Tuesday", "Wednesday",
+                                              "Thursday", "Friday",
+                                              "Saturday")),
+                  month = factor(months(day),
+                                 levels = c("March", "April",
+                                            "May", "June",
+                                            "July", "August",
+                                            "September")))
+
+ggplot(to_plot, aes(x = weekday, y = deaths)) + 
+        geom_boxplot() + 
+        facet_grid(cause ~ ., scales = "free_y")
+
+ggplot(to_plot, aes(x = month, y = deaths)) + 
+        geom_boxplot() + 
+        facet_grid(cause ~ ., scales = "free_y")
+```
+
+
+There don't seem to be large trends by day of the week, but there do seem to be large trends by month. I'll try out doing Whitaker et al.'s (2006) case series model to explore the relationship between temperature and these two causes of mortality, including a stratum variable for month. 
+
+I'll start by adding a variable for risk periods (defined as before as days with maximum temperature 28C or higher):
+
+```{r}
+cardioresp_deaths <- mutate(cardioresp_deaths,
+                            heat_day = temp_max >= 28)
+to_plot <- mutate(to_plot,
+                  heat_day = temp_max >= 28)
+```
+
+Here is a plot of deaths by temperature for each cause and within each month. Color is used to show which days are "heat risk" days.
+
+```{r, warning = FALSE, fig.width = 10, fig.height = 2.5}
+ggplot(to_plot, aes(x = temp_max, y = deaths, color = heat_day)) +
+        geom_point(size = 2) + 
+        facet_grid(cause ~ month, scales = "free_y")
+```
+
+The only months that have differences in exposure (i.e., some days in risk periods, some not) are the months of March, April, and May. I think that this means that we'd get the same final answer if we exclude all data from other months (*Note: is this right?*).
+
+Let me start by fitting the model without putting `month` as a stratum.
+
+```{r}
+mod_3_cvd <- glm(cvd_deaths ~ heat_day,
+             data = cardioresp_deaths,
+             family = poisson(link = "log"))
+summary(mod_3_cvd)$coef
+
+mod_3_resp <- glm(resp_deaths ~ heat_day,
+             data = cardioresp_deaths,
+             family = poisson(link = "log"))
+summary(mod_3_resp)$coef
+```
+
+Based on this model, the relative incidence for a risk period compared to a non-risk period is:
+
+For cardiovascular deaths:
+
+```{r}
+cvd_coef <- summary(mod_3_cvd)$coef
+point <- round((exp(cvd_coef[2, 1]) - 1) * 100, 1)
+cis <- round((exp((cvd_coef[2, 1] + 
+                          c(-1, 1) * 1.96 * cvd_coef[2, 2])) - 1)
+             * 100, 1)
+paste0(point, "%, (", cis[1], ", ", cis[2], "%)")
+```
+
+For respiratory deaths:
+
+```{r}
+resp_coef <- summary(mod_3_resp)$coef
+point <- round((exp(resp_coef[2, 1]) - 1) * 100, 1)
+cis <- round((exp((resp_coef[2, 1] + 
+                          c(-1, 1) * 1.96 * resp_coef[2, 2])) - 1)
+             * 100, 1)
+paste0(point, "%, (", cis[1], ", ", cis[2], "%)")
+```
+
+And I think we should get the same values if we collapse all the data by risk period status and then fit a Poisson GLM with an offset included for the number of days in each risk class. 
+
+Here is the collapsed data for that:
+
+```{r}
+cardioresp_tab <- filter(cardioresp_deaths, !is.na(temp_max)) %>%
+        group_by(heat_day) %>%
+        summarise(days = n(),
+                  cvd_events = sum(cvd_deaths),
+                  resp_events = sum(resp_deaths))
+cardioresp_tab
+```
+
+And here are the models and results:
+
+```{r}
+mod_4_cvd <- glm(cvd_events ~ heat_day,
+                 offset = log(days),
+                 data = cardioresp_tab,
+                 family = poisson(link = "log"))
+summary(mod_4_cvd)$coef
+
+mod_4_resp <- glm(resp_events ~ heat_day,
+                 offset = log(days),
+                 data = cardioresp_tab,
+                 family = poisson(link = "log"))
+summary(mod_4_resp)$coef
+```
+
+Yep, this results in the same model coefficients for heat risk period.
+
+### Poisson GLM fit with month strata
+
+So, now I'll try adding month as a stratum variable. First, I'll add it into the Poisson GLM:
+
+```{r}
+cardioresp_deaths <- mutate(cardioresp_deaths,
+                            month = factor(months(day),
+                                           levels = c("March", 
+                                                      "April", "May",
+                                                      "June", "July",
+                                                      "August",
+                                                      "September")))
+
+mod_5_cvd <- glm(cvd_deaths ~ heat_day + month,
+                 data = cardioresp_deaths,
+                 family = poisson(link = "log"))
+summary(mod_5_cvd)$coef
+
+mod_5_resp <- glm(resp_deaths ~ heat_day + month,
+                 data = cardioresp_deaths,
+                 family = poisson(link = "log"))
+summary(mod_5_resp)$coef
+```
+
+Now, the effect estimates for relative incidence are:
+
+For cardiovascular deaths:
+
+```{r}
+cvd_coef <- summary(mod_5_cvd)$coef
+point <- round((exp(cvd_coef[2, 1]) - 1) * 100, 1)
+cis <- round((exp((cvd_coef[2, 1] + 
+                          c(-1, 1) * 1.96 * cvd_coef[2, 2])) - 1)
+             * 100, 1)
+paste0(point, "%, (", cis[1], ", ", cis[2], "%)")
+```
+
+For respiratory deaths:
+
+```{r}
+resp_coef <- summary(mod_5_resp)$coef
+point <- round((exp(resp_coef[2, 1]) - 1) * 100, 1)
+cis <- round((exp((resp_coef[2, 1] + 
+                          c(-1, 1) * 1.96 * resp_coef[2, 2])) - 1)
+             * 100, 1)
+paste0(point, "%, (", cis[1], ", ", cis[2], "%)")
+```
+
+The estimate for cardiovascular deaths has gone up a bit, and the one for respiratory deaths has gone down a bit. 
+
+### Collapsed data approach, with strata
+
+Let's see if we again get the exact same answer using a collapsed table version of the data, this time collapsed over risk period and month:
+
+```{r}
+cardioresp_tab <- filter(cardioresp_deaths, !is.na(temp_max)) %>%
+        group_by(heat_day, month) %>%
+        summarise(days = n(),
+                  cvd_events = sum(cvd_deaths),
+                  resp_events = sum(resp_deaths)) %>% 
+        filter(month %in% c("March", "April", "May"))
+cardioresp_tab
+```
+
+Note that I have taken out any month that did not have at least one day of each exposure type, which leaves only the months of March, April, and May.
+
+Now I'll fit a Poisson GLM with an offset of days to this collapsed data:
+
+```{r}
+mod_6_cvd <- glm(cvd_events ~ heat_day + month,
+                 offset = log(days),
+                 data = cardioresp_tab,
+                 family = poisson(link = "log"))
+summary(mod_6_cvd)$coef
+
+cvd_coef <- summary(mod_6_cvd)$coef
+point <- round((exp(cvd_coef[2, 1]) - 1) * 100, 1)
+cis <- round((exp((cvd_coef[2, 1] + 
+                          c(-1, 1) * 1.96 * cvd_coef[2, 2])) - 1)
+             * 100, 1)
+paste0(point, "%, (", cis[1], ", ", cis[2], "%)")
+
+mod_6_resp <- glm(resp_events ~ heat_day + month,
+                 offset = log(days),
+                 data = cardioresp_tab,
+                 family = poisson(link = "log"))
+summary(mod_6_resp)$coef
+
+resp_coef <- summary(mod_6_resp)$coef
+point <- round((exp(resp_coef[2, 1]) - 1) * 100, 1)
+cis <- round((exp((resp_coef[2, 1] + 
+                          c(-1, 1) * 1.96 * resp_coef[2, 2])) - 1)
+             * 100, 1)
+paste0(point, "%, (", cis[1], ", ", cis[2], "%)")
+```
+
+This does give the same result as fitting the GLM to the data where there was one observation per date.
+
+### Semi-expanded, then conditional logistic approach
+
+Based on Armstrong et al.'s 2014 paper on conditional Poisson models, there should be two other equivalent ways we can fit this data. First, we should be able to "semi-expand" the data and then fit the model with a conditional logistic model, and we should also be able to use a conditional Poisson model to fit the data from a one-line-per-date format.
+
+First, I'll have to "semi-expand" the data, to make it so every day has one "case" day and then "control" days to match with every other day in its strata.
+
+```{r}
+month_days <- table(months(cardioresp_deaths$day))
+month_days <- data_frame(month = names(month_days),
+                         month_days = month_days)
+strata <- cardioresp_deaths[ , c("day", "month")]
+strata$date.strata <- as.character(strata$day)
+
+semi_expand <- mutate(cardioresp_deaths, 
+                      month = months(cardioresp_deaths$day)) %>%
+        left_join(month_days) %>%
+        filter(month %in% c("March", "April", "May"))
+for(i in 1:nrow(semi_expand)){
+        df <- semi_expand[rep(i, each = semi_expand$month_days[i]), ]
+        df$case_day <- c(1, rep(0,
+                           length = semi_expand$month_days[i] - 1))
+        df$case_con_set <- c(strata$date.strata[strata$day ==
+                                                        df$day[1]],
+                             strata$date.strata[strata$month == 
+                                 df$month[1] & strata$day != 
+                                         df$day[1]])
+        if(i == 1){
+                semi_expand_df <- df
+        } else {
+                semi_expand_df <- rbind(semi_expand_df, df)
+        }
+}
+
+head(semi_expand_df)
+tail(semi_expand_df)
+```
+
+Now I'll try fitting the conditional logistic regression to this semi-expanded data frame:
+
+```{r}
+timeout <- as.numeric(factor(semi_expand_df$case_con_set))
+timein <- timeout - 0.1
+mod_7_cvd <- coxph(Surv(timein, timeout, case_day) ~ heat_day, 
+                   weights = cvd_deaths, 
+                   data = semi_expand_df)
+summary(mod_7_cvd)
+```
+
+This does not seem to be working correctly. I'll need to check what's going on here...
+
+### Conditional Poisson approach
+
+```{r}
+mod_8_cvd <- gnm(cvd_deaths ~ heat_day,
+                 data = cardioresp_deaths,
+                 family = poisson,
+                 eliminate = month)
+summary(mod_8_cvd)$coef
+
+mod_8_resp <- gnm(resp_deaths ~ heat_day,
+                 data = cardioresp_deaths,
+                 family = poisson,
+                 eliminate = month)
+summary(mod_8_resp)$coef
+```
+
+Yep, we get exactly the same results with this model.
+
+With this model, we can also try out a model that allows for overdispersion, for example, for the cardiovascular deaths:
+
+```{r}
+mod_9_cvd <- gnm(cvd_deaths ~ heat_day,
+                 data = cardioresp_deaths,
+                 family = quasipoisson,
+                 eliminate = month)
+summary(mod_9_cvd)$coef
+
+mod_9_resp <- gnm(resp_deaths ~ heat_day,
+                 data = cardioresp_deaths,
+                 family = quasipoisson,
+                 eliminate = month)
+summary(mod_9_resp)$coef
+```
+
+Point estimates are almost exactly the same, but standard errors are a bit larger (and so confidence intervals would be a bit larger).
+
+We can also use this model type to try out a model that includes adjustment for autocorrelation at lag 1 (using the Brumback autocorrelation adjustment):
+
+```{r}
+cardioresp_deaths <- filter(cardioresp_deaths,
+                            !is.na(temp_max))
+res_lag1 <- Lag(residuals(mod_9_cvd, type = "deviance"), 1)
+mod_10_cvd <- gnm(cvd_deaths ~ heat_day + res_lag1,
+                 data = cardioresp_deaths,
+                 family = quasipoisson,
+                 eliminate = month)
+summary(mod_10_cvd)$coef
+
+res_lag1 <- Lag(residuals(mod_9_resp, type = "deviance"), 1)
+mod_10_resp <- gnm(resp_deaths ~ heat_day + res_lag1,
+                 data = cardioresp_deaths,
+                 family = quasipoisson,
+                 eliminate = month)
+summary(mod_10_resp)$coef
+```
+
+Effect estimates have changed very little.
